@@ -82,6 +82,7 @@ import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
+import { jsonPath } from '@utils/jsonPath';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { status } from '@utils/renderStatus';
@@ -520,14 +521,32 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  private get isMysql(): boolean {
+    return this.configService.get<Database>('DATABASE').PROVIDER === 'mysql';
+  }
+
+  // Raw SQL is used to avoid JSON path issues; syntax differs between PostgreSQL and MySQL
+  private async findMessageRowsByKeyId(keyId: string): Promise<any[]> {
+    if (this.isMysql) {
+      return this.prismaRepository.$queryRaw`
+        SELECT * FROM \`Message\`
+        WHERE \`instanceId\` = ${this.instanceId}
+        AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.id')) = ${keyId}
+        LIMIT 1
+      `;
+    }
+
+    return this.prismaRepository.$queryRaw`
+      SELECT * FROM "Message"
+      WHERE "instanceId" = ${this.instanceId}
+      AND "key"->>'id' = ${keyId}
+      LIMIT 1
+    `;
+  }
+
   private async getMessage(key: proto.IMessageKey, full = false) {
     try {
-      // Use raw SQL to avoid JSON path issues
-      const webMessageInfo = (await this.prismaRepository.$queryRaw`
-        SELECT * FROM "Message"
-        WHERE "instanceId" = ${this.instanceId}
-        AND "key"->>'id' = ${key.id}
-      `) as proto.IWebMessageInfo[];
+      const webMessageInfo = (await this.findMessageRowsByKeyId(key.id)) as proto.IWebMessageInfo[];
 
       if (full) {
         return webMessageInfo[0];
@@ -1637,12 +1656,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
             const searchId = originalMessageId || key.id;
 
-            const messages = (await this.prismaRepository.$queryRaw`
-              SELECT * FROM "Message"
-              WHERE "instanceId" = ${this.instanceId}
-              AND "key"->>'id' = ${searchId}
-              LIMIT 1
-            `) as any[];
+            const messages = await this.findMessageRowsByKeyId(searchId);
             findMessage = messages[0] || null;
 
             if (!findMessage?.id) {
@@ -3776,7 +3790,7 @@ export class BaileysStartupService extends ChannelStartupService {
         if (messageId) {
           const isLogicalDeleted = configService.get<Database>('DATABASE').DELETE_DATA.LOGICAL_MESSAGE_DELETE;
           let message = await this.prismaRepository.message.findFirst({
-            where: { key: { path: ['id'], equals: messageId } },
+            where: { key: { path: jsonPath('id'), equals: messageId } },
           });
           if (isLogicalDeleted) {
             if (!message) return response;
@@ -4196,7 +4210,7 @@ export class BaileysStartupService extends ChannelStartupService {
           const messageId = messageSent.message?.protocolMessage?.key?.id;
           if (messageId && this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
             let message = await this.prismaRepository.message.findFirst({
-              where: { key: { path: ['id'], equals: messageId } },
+              where: { key: { path: jsonPath('id'), equals: messageId } },
             });
             if (!message) throw new NotFoundException('Message not found');
 
@@ -4735,15 +4749,25 @@ export class BaileysStartupService extends ChannelStartupService {
     if (timestamp === undefined || timestamp === null) return 0;
 
     // Use raw SQL to avoid JSON path issues
-    const result = await this.prismaRepository.$executeRaw`
-      UPDATE "Message"
-      SET "status" = ${status[4]}
-      WHERE "instanceId" = ${this.instanceId}
-      AND "key"->>'remoteJid' = ${remoteJid}
-      AND ("key"->>'fromMe')::boolean = false
-      AND "messageTimestamp" <= ${timestamp}
-      AND ("status" IS NULL OR "status" = ${status[3]})
-    `;
+    const result = this.isMysql
+      ? await this.prismaRepository.$executeRaw`
+          UPDATE \`Message\`
+          SET \`status\` = ${status[4]}
+          WHERE \`instanceId\` = ${this.instanceId}
+          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.remoteJid')) = ${remoteJid}
+          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.fromMe')) = 'false'
+          AND \`messageTimestamp\` <= ${timestamp}
+          AND (\`status\` IS NULL OR \`status\` = ${status[3]})
+        `
+      : await this.prismaRepository.$executeRaw`
+          UPDATE "Message"
+          SET "status" = ${status[4]}
+          WHERE "instanceId" = ${this.instanceId}
+          AND "key"->>'remoteJid' = ${remoteJid}
+          AND ("key"->>'fromMe')::boolean = false
+          AND "messageTimestamp" <= ${timestamp}
+          AND ("status" IS NULL OR "status" = ${status[3]})
+        `;
 
     if (result) {
       if (result > 0) {
@@ -4760,13 +4784,22 @@ export class BaileysStartupService extends ChannelStartupService {
     const [chat, unreadMessages] = await Promise.all([
       this.prismaRepository.chat.findFirst({ where: { remoteJid } }),
       // Use raw SQL to avoid JSON path issues
-      this.prismaRepository.$queryRaw`
-        SELECT COUNT(*)::int as count FROM "Message"
-        WHERE "instanceId" = ${this.instanceId}
-        AND "key"->>'remoteJid' = ${remoteJid}
-        AND ("key"->>'fromMe')::boolean = false
-        AND "status" = ${status[3]}
-      `.then((result: any[]) => result[0]?.count || 0),
+      (this.isMysql
+        ? this.prismaRepository.$queryRaw`
+            SELECT COUNT(*) as count FROM \`Message\`
+            WHERE \`instanceId\` = ${this.instanceId}
+            AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.remoteJid')) = ${remoteJid}
+            AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.fromMe')) = 'false'
+            AND \`status\` = ${status[3]}
+          `
+        : this.prismaRepository.$queryRaw`
+            SELECT COUNT(*)::int as count FROM "Message"
+            WHERE "instanceId" = ${this.instanceId}
+            AND "key"->>'remoteJid' = ${remoteJid}
+            AND ("key"->>'fromMe')::boolean = false
+            AND "status" = ${status[3]}
+          `
+      ).then((result: any[]) => Number(result[0]?.count) || 0),
     ]);
 
     if (chat && chat.unreadMessages !== unreadMessages) {
@@ -4776,7 +4809,25 @@ export class BaileysStartupService extends ChannelStartupService {
     return unreadMessages;
   }
 
+  // MySQL has no jsonb array helpers, so the chat labels are merged in application code
+  private async updateChatLabelsMysql(instanceId: string, chatId: string, update: (labels: string[]) => string[]) {
+    const where = { instanceId_remoteJid: { instanceId, remoteJid: chatId } };
+    const chat = await this.prismaRepository.chat.findUnique({ where });
+    const current = Array.isArray(chat?.labels) ? (chat.labels as string[]) : [];
+    const labels = update(current);
+
+    await this.prismaRepository.chat.upsert({
+      where,
+      create: { id: cuid(), instanceId, remoteJid: chatId, labels },
+      update: { labels },
+    });
+  }
+
   private async addLabel(labelId: string, instanceId: string, chatId: string) {
+    if (this.isMysql) {
+      return this.updateChatLabelsMysql(instanceId, chatId, (labels) => [...new Set([...labels, labelId])]);
+    }
+
     const id = cuid();
 
     await this.prismaRepository.$executeRawUnsafe(
@@ -4801,6 +4852,10 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async removeLabel(labelId: string, instanceId: string, chatId: string) {
+    if (this.isMysql) {
+      return this.updateChatLabelsMysql(instanceId, chatId, (labels) => labels.filter((label) => label !== labelId));
+    }
+
     const id = cuid();
 
     await this.prismaRepository.$executeRawUnsafe(
@@ -5034,13 +5089,15 @@ export class BaileysStartupService extends ChannelStartupService {
         messageType: query?.where?.messageType,
         ...timestampFilter,
         AND: [
-          keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
+          keyFilters?.id ? { key: { path: jsonPath('id'), equals: keyFilters?.id } } : {},
+          keyFilters?.fromMe ? { key: { path: jsonPath('fromMe'), equals: keyFilters?.fromMe } } : {},
+          keyFilters?.participant ? { key: { path: jsonPath('participant'), equals: keyFilters?.participant } } : {},
           {
             OR: [
-              keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
-              keyFilters?.remoteJidAlt ? { key: { path: ['remoteJidAlt'], equals: keyFilters?.remoteJidAlt } } : {},
+              keyFilters?.remoteJid ? { key: { path: jsonPath('remoteJid'), equals: keyFilters?.remoteJid } } : {},
+              keyFilters?.remoteJidAlt
+                ? { key: { path: jsonPath('remoteJidAlt'), equals: keyFilters?.remoteJidAlt } }
+                : {},
             ],
           },
         ],
@@ -5063,13 +5120,15 @@ export class BaileysStartupService extends ChannelStartupService {
         messageType: query?.where?.messageType,
         ...timestampFilter,
         AND: [
-          keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
+          keyFilters?.id ? { key: { path: jsonPath('id'), equals: keyFilters?.id } } : {},
+          keyFilters?.fromMe ? { key: { path: jsonPath('fromMe'), equals: keyFilters?.fromMe } } : {},
+          keyFilters?.participant ? { key: { path: jsonPath('participant'), equals: keyFilters?.participant } } : {},
           {
             OR: [
-              keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
-              keyFilters?.remoteJidAlt ? { key: { path: ['remoteJidAlt'], equals: keyFilters?.remoteJidAlt } } : {},
+              keyFilters?.remoteJid ? { key: { path: jsonPath('remoteJid'), equals: keyFilters?.remoteJid } } : {},
+              keyFilters?.remoteJidAlt
+                ? { key: { path: jsonPath('remoteJidAlt'), equals: keyFilters?.remoteJidAlt } }
+                : {},
             ],
           },
         ],
