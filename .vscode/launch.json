@@ -4,7 +4,7 @@
     {
       "type": "node",
       "request": "launch",
-      "name": "Debug Evolution API",
+      "name": "run dev server",
       "runtimeExecutable": "npm",
       "runtimeArgs": [
         "run",
