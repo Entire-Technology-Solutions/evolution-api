@@ -14,6 +14,7 @@ import { Logger } from '@config/logger.config';
 import { NotFoundException } from '@exceptions';
 import { Contact, Message, Prisma } from '@prisma/client';
 import { createJid } from '@utils/createJid';
+import { isMysql, jsonPath } from '@utils/jsonPath';
 import { WASocket } from 'baileys';
 import { isArray } from 'class-validator';
 import EventEmitter2 from 'eventemitter2';
@@ -623,10 +624,10 @@ export class ChannelStartupService {
         messageType: query?.where?.messageType,
         ...timestampFilter,
         AND: [
-          keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
-          keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
+          keyFilters?.id ? { key: { path: jsonPath('id'), equals: keyFilters?.id } } : {},
+          keyFilters?.fromMe ? { key: { path: jsonPath('fromMe'), equals: keyFilters?.fromMe } } : {},
+          keyFilters?.remoteJid ? { key: { path: jsonPath('remoteJid'), equals: keyFilters?.remoteJid } } : {},
+          keyFilters?.participants ? { key: { path: jsonPath('participants'), equals: keyFilters?.participants } } : {},
         ],
       },
     });
@@ -647,10 +648,10 @@ export class ChannelStartupService {
         messageType: query?.where?.messageType,
         ...timestampFilter,
         AND: [
-          keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
-          keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
+          keyFilters?.id ? { key: { path: jsonPath('id'), equals: keyFilters?.id } } : {},
+          keyFilters?.fromMe ? { key: { path: jsonPath('fromMe'), equals: keyFilters?.fromMe } } : {},
+          keyFilters?.remoteJid ? { key: { path: jsonPath('remoteJid'), equals: keyFilters?.remoteJid } } : {},
+          keyFilters?.participants ? { key: { path: jsonPath('participants'), equals: keyFilters?.participants } } : {},
         ],
       },
       orderBy: {
@@ -741,7 +742,118 @@ export class ChannelStartupService {
     const limit = query?.take ? Prisma.sql`LIMIT ${query.take}` : Prisma.sql``;
     const offset = query?.skip ? Prisma.sql`OFFSET ${query.skip}` : Prisma.sql``;
 
-    const results = await this.prismaRepository.$queryRaw`
+    const results = isMysql()
+      ? await this.fetchChatsMysql(remoteJid, query, limit, offset)
+      : await this.fetchChatsPostgres(remoteJid, timestampFilter, limit, offset);
+
+    if (results && isArray(results) && results.length > 0) {
+      const mappedResults = results.map((contact) => {
+        const lastMessage = contact.lastMessageId
+          ? {
+              id: contact.lastMessageId,
+              key: contact.lastMessage_key,
+              pushName: contact.lastMessagePushName,
+              participant: contact.lastMessageParticipant,
+              messageType: contact.lastMessageMessageType,
+              message: contact.lastMessageMessage,
+              contextInfo: contact.lastMessageContextInfo,
+              source: contact.lastMessageSource,
+              messageTimestamp: contact.lastMessageMessageTimestamp,
+              instanceId: contact.lastMessageInstanceId,
+              sessionId: contact.lastMessageSessionId,
+              status: contact.lastMessageStatus,
+            }
+          : undefined;
+
+        return {
+          id: contact.contactId || null,
+          remoteJid: contact.remoteJid,
+          pushName: contact.pushName,
+          profilePicUrl: contact.profilePicUrl,
+          updatedAt: contact.updatedAt,
+          windowStart: contact.windowStart,
+          windowExpires: contact.windowExpires,
+          windowActive: contact.windowActive === null ? null : Boolean(contact.windowActive),
+          lastMessage: lastMessage ? this.cleanMessageData(lastMessage) : undefined,
+          unreadCount: contact.unreadMessages === null ? null : Number(contact.unreadMessages),
+          isSaved: !!contact.contactId,
+        };
+      });
+
+      return mappedResults;
+    }
+
+    return [];
+  }
+
+  private async fetchChatsMysql(remoteJid: string | null, query: any, limit: Prisma.Sql, offset: Prisma.Sql) {
+    const gte = query?.where?.messageTimestamp?.gte;
+    const lte = query?.where?.messageTimestamp?.lte;
+    const timestampFilter =
+      gte && lte
+        ? Prisma.sql`
+        AND \`Message\`.\`messageTimestamp\` >= ${Math.floor(new Date(gte).getTime() / 1000)}
+        AND \`Message\`.\`messageTimestamp\` <= ${Math.floor(new Date(lte).getTime() / 1000)}`
+        : Prisma.sql``;
+    // MySQL does not accept OFFSET without LIMIT
+    const limitSql = !query?.take && query?.skip ? Prisma.sql`LIMIT 18446744073709551615` : limit;
+
+    return this.prismaRepository.$queryRaw<any[]>`
+      WITH rankedMessages AS (
+        SELECT
+          \`Contact\`.\`id\` AS \`contactId\`,
+          JSON_UNQUOTE(JSON_EXTRACT(\`Message\`.\`key\`, '$.remoteJid')) AS \`remoteJid\`,
+          CASE
+            WHEN JSON_UNQUOTE(JSON_EXTRACT(\`Message\`.\`key\`, '$.remoteJid')) LIKE '%@g.us' THEN COALESCE(\`Chat\`.\`name\`, \`Contact\`.\`pushName\`)
+            ELSE COALESCE(\`Contact\`.\`pushName\`, \`Message\`.\`pushName\`)
+          END AS \`pushName\`,
+          \`Contact\`.\`profilePicUrl\`,
+          COALESCE(FROM_UNIXTIME(\`Message\`.\`messageTimestamp\`), \`Contact\`.\`updatedAt\`) AS \`updatedAt\`,
+          \`Chat\`.\`createdAt\` AS \`windowStart\`,
+          \`Chat\`.\`createdAt\` + INTERVAL 24 HOUR AS \`windowExpires\`,
+          \`Chat\`.\`unreadMessages\` AS \`unreadMessages\`,
+          CASE WHEN \`Chat\`.\`createdAt\` + INTERVAL 24 HOUR > NOW() THEN 1 ELSE 0 END AS \`windowActive\`,
+          \`Message\`.\`id\` AS \`lastMessageId\`,
+          \`Message\`.\`key\` AS \`lastMessage_key\`,
+          CASE
+            WHEN JSON_UNQUOTE(JSON_EXTRACT(\`Message\`.\`key\`, '$.fromMe')) = 'true' THEN 'Você'
+            ELSE \`Message\`.\`pushName\`
+          END AS \`lastMessagePushName\`,
+          \`Message\`.\`participant\` AS \`lastMessageParticipant\`,
+          \`Message\`.\`messageType\` AS \`lastMessageMessageType\`,
+          \`Message\`.\`message\` AS \`lastMessageMessage\`,
+          \`Message\`.\`contextInfo\` AS \`lastMessageContextInfo\`,
+          \`Message\`.\`source\` AS \`lastMessageSource\`,
+          \`Message\`.\`messageTimestamp\` AS \`lastMessageMessageTimestamp\`,
+          \`Message\`.\`instanceId\` AS \`lastMessageInstanceId\`,
+          \`Message\`.\`sessionId\` AS \`lastMessageSessionId\`,
+          \`Message\`.\`status\` AS \`lastMessageStatus\`,
+          ROW_NUMBER() OVER (
+            PARTITION BY JSON_UNQUOTE(JSON_EXTRACT(\`Message\`.\`key\`, '$.remoteJid'))
+            ORDER BY \`Message\`.\`messageTimestamp\` DESC
+          ) AS \`rn\`
+        FROM \`Message\`
+        LEFT JOIN \`Contact\` ON \`Contact\`.\`remoteJid\` = JSON_UNQUOTE(JSON_EXTRACT(\`Message\`.\`key\`, '$.remoteJid')) AND \`Contact\`.\`instanceId\` = \`Message\`.\`instanceId\`
+        LEFT JOIN \`Chat\` ON \`Chat\`.\`remoteJid\` = JSON_UNQUOTE(JSON_EXTRACT(\`Message\`.\`key\`, '$.remoteJid')) AND \`Chat\`.\`instanceId\` = \`Message\`.\`instanceId\`
+        WHERE \`Message\`.\`instanceId\` = ${this.instanceId}
+        ${remoteJid ? Prisma.sql`AND JSON_UNQUOTE(JSON_EXTRACT(\`Message\`.\`key\`, '$.remoteJid')) = ${remoteJid}` : Prisma.sql``}
+        ${timestampFilter}
+      )
+      SELECT * FROM rankedMessages
+      WHERE \`rn\` = 1
+      ORDER BY (\`updatedAt\` IS NULL), \`updatedAt\` DESC
+      ${limitSql}
+      ${offset};
+    `;
+  }
+
+  private async fetchChatsPostgres(
+    remoteJid: string | null,
+    timestampFilter: Prisma.Sql,
+    limit: Prisma.Sql,
+    offset: Prisma.Sql,
+  ) {
+    return this.prismaRepository.$queryRaw<any[]>`
       WITH rankedMessages AS (
         SELECT DISTINCT ON ("Message"."key"->>'remoteJid') 
           "Contact"."id" as "contactId",
@@ -788,45 +900,6 @@ export class ChannelStartupService {
       ${limit}
       ${offset};
     `;
-
-    if (results && isArray(results) && results.length > 0) {
-      const mappedResults = results.map((contact) => {
-        const lastMessage = contact.lastMessageId
-          ? {
-              id: contact.lastMessageId,
-              key: contact.lastMessage_key,
-              pushName: contact.lastMessagePushName,
-              participant: contact.lastMessageParticipant,
-              messageType: contact.lastMessageMessageType,
-              message: contact.lastMessageMessage,
-              contextInfo: contact.lastMessageContextInfo,
-              source: contact.lastMessageSource,
-              messageTimestamp: contact.lastMessageMessageTimestamp,
-              instanceId: contact.lastMessageInstanceId,
-              sessionId: contact.lastMessageSessionId,
-              status: contact.lastMessageStatus,
-            }
-          : undefined;
-
-        return {
-          id: contact.contactId || null,
-          remoteJid: contact.remoteJid,
-          pushName: contact.pushName,
-          profilePicUrl: contact.profilePicUrl,
-          updatedAt: contact.updatedAt,
-          windowStart: contact.windowStart,
-          windowExpires: contact.windowExpires,
-          windowActive: contact.windowActive,
-          lastMessage: lastMessage ? this.cleanMessageData(lastMessage) : undefined,
-          unreadCount: contact.unreadMessages,
-          isSaved: !!contact.contactId,
-        };
-      });
-
-      return mappedResults;
-    }
-
-    return [];
   }
 
   public hasValidMediaContent(message: any): boolean {

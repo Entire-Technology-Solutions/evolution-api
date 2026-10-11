@@ -21,6 +21,7 @@ import ChatwootClient, {
 import { request as chatwootRequest } from '@figuro/chatwoot-sdk/dist/core/request';
 import { Chatwoot as ChatwootModel, Contact as ContactModel, Message as MessageModel } from '@prisma/client';
 import i18next from '@utils/i18n';
+import { isMysql, jsonPath } from '@utils/jsonPath';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import axios from 'axios';
 import { WAMessageContent, WAMessageKey } from 'baileys';
@@ -1546,7 +1547,7 @@ export class ChatwootService {
           const lastMessage = await this.prismaRepository.message.findFirst({
             where: {
               key: {
-                path: ['fromMe'],
+                path: jsonPath('fromMe'),
                 equals: false,
               },
               instanceId: instance.instanceId,
@@ -1576,7 +1577,7 @@ export class ChatwootService {
               where: {
                 instanceId: instance.instanceId,
                 key: {
-                  path: ['id'],
+                  path: jsonPath('id'),
                   equals: key.id,
                 },
               },
@@ -1618,17 +1619,29 @@ export class ChatwootService {
     }
 
     // Use raw SQL to avoid JSON path issues
-    const result = await this.prismaRepository.$executeRaw`
-      UPDATE "Message" 
-      SET 
-        "chatwootMessageId" = ${chatwootMessageIds.messageId},
-        "chatwootConversationId" = ${chatwootMessageIds.conversationId},
-        "chatwootInboxId" = ${chatwootMessageIds.inboxId},
-        "chatwootContactInboxSourceId" = ${chatwootMessageIds.contactInboxSourceId},
-        "chatwootIsRead" = ${chatwootMessageIds.isRead || false}
-      WHERE "instanceId" = ${instance.instanceId} 
-      AND "key"->>'id' = ${key.id}
-    `;
+    const result = isMysql()
+      ? await this.prismaRepository.$executeRaw`
+          UPDATE \`Message\`
+          SET
+            \`chatwootMessageId\` = ${chatwootMessageIds.messageId},
+            \`chatwootConversationId\` = ${chatwootMessageIds.conversationId},
+            \`chatwootInboxId\` = ${chatwootMessageIds.inboxId},
+            \`chatwootContactInboxSourceId\` = ${chatwootMessageIds.contactInboxSourceId},
+            \`chatwootIsRead\` = ${chatwootMessageIds.isRead || false}
+          WHERE \`instanceId\` = ${instance.instanceId}
+          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.id')) = ${key.id}
+        `
+      : await this.prismaRepository.$executeRaw`
+          UPDATE "Message"
+          SET
+            "chatwootMessageId" = ${chatwootMessageIds.messageId},
+            "chatwootConversationId" = ${chatwootMessageIds.conversationId},
+            "chatwootInboxId" = ${chatwootMessageIds.inboxId},
+            "chatwootContactInboxSourceId" = ${chatwootMessageIds.contactInboxSourceId},
+            "chatwootIsRead" = ${chatwootMessageIds.isRead || false}
+          WHERE "instanceId" = ${instance.instanceId}
+          AND "key"->>'id' = ${key.id}
+        `;
 
     this.logger.verbose(`Update result: ${result} rows affected`);
 
@@ -1643,12 +1656,19 @@ export class ChatwootService {
 
   private async getMessageByKeyId(instance: InstanceDto, keyId: string): Promise<MessageModel> {
     // Use raw SQL query to avoid JSON path issues with Prisma
-    const messages = await this.prismaRepository.$queryRaw`
-      SELECT * FROM "Message" 
-      WHERE "instanceId" = ${instance.instanceId} 
-      AND "key"->>'id' = ${keyId}
-      LIMIT 1
-    `;
+    const messages = isMysql()
+      ? await this.prismaRepository.$queryRaw`
+          SELECT * FROM \`Message\`
+          WHERE \`instanceId\` = ${instance.instanceId}
+          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.id')) = ${keyId}
+          LIMIT 1
+        `
+      : await this.prismaRepository.$queryRaw`
+          SELECT * FROM "Message"
+          WHERE "instanceId" = ${instance.instanceId}
+          AND "key"->>'id' = ${keyId}
+          LIMIT 1
+        `;
 
     return (messages as MessageModel[])[0] || null;
   }
@@ -2025,7 +2045,7 @@ export class ChatwootService {
           quotedMsg = await this.prismaRepository.message.findFirst({
             where: {
               key: {
-                path: ['id'],
+                path: jsonPath('id'),
                 equals: quotedId,
               },
               chatwootMessageId: {
@@ -2337,7 +2357,7 @@ export class ChatwootService {
             await this.prismaRepository.message.deleteMany({
               where: {
                 key: {
-                  path: ['id'],
+                  path: jsonPath('id'),
                   equals: body.key.id,
                 },
                 instanceId: instance.instanceId,
@@ -2679,7 +2699,7 @@ export class ChatwootService {
         where: {
           Instance: { name: instance.instanceName },
           messageTimestamp: { gte: Number(dayjs().subtract(6, 'hours').unix()) },
-          AND: ids.map((id) => ({ key: { path: ['id'], not: id } })),
+          AND: ids.map((id) => ({ key: { path: jsonPath('id'), not: id } })),
         },
       });
 
